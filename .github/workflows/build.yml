@@ -1,0 +1,35 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:          # cho phép bấm nút chạy tay
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Lấy mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Cài JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cài Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build APK (debug)
+        run: gradle assembleDebug --stacktrace
+
+      - name: Tải APK lên Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LangID-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
