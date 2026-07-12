@@ -404,15 +404,22 @@ private fun ResultCard(r: JSONObject, speaker: Speaker) {
                             if (pa.isNotBlank()) Text("[$pa]", fontSize = 12.sp, color = Color.Gray)
                         }
                         IconButton(onClick = {
-                            speaker.speak(target, langTag) {
-                                android.widget.Toast.makeText(
-                                    ctx, "Máy chưa cài giọng đọc cho ngôn ngữ này",
-                                    android.widget.Toast.LENGTH_SHORT
+                            speaker.speak(target, langTag) { err ->
+                                if (err != null) android.widget.Toast.makeText(
+                                    ctx, err, android.widget.Toast.LENGTH_LONG
                                 ).show()
                             }
                         }) { Icon(Icons.Default.VolumeUp, "Phát") }
                     }
                 }
+            }
+
+            OutlinedButton(
+                onClick = { openInstallVoice(ctx) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.RecordVoiceOver, null); Spacer(Modifier.width(6.dp))
+                Text("CÀI GIỌNG ĐỌC (nếu loa không phát)")
             }
 
             Surface(color = Color(0xFFE8F5E9), shape = MaterialTheme.shapes.small,
@@ -538,8 +545,14 @@ fun ChatTab(cfg: Config, speaker: Speaker, theirLang: String, theirLangTag: Stri
                             Text(t.translated, fontSize = 16.sp,
                                 fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
                             IconButton(onClick = {
-                                speaker.speak(t.translated,
-                                    if (t.foreigner) "vi-VN" else theirLangTag)
+                                speaker.speak(
+                                    t.translated,
+                                    if (t.foreigner) "vi-VN" else theirLangTag
+                                ) { err ->
+                                    if (err != null) android.widget.Toast.makeText(
+                                        ctx, err, android.widget.Toast.LENGTH_LONG
+                                    ).show()
+                                }
                             }) { Icon(Icons.Default.VolumeUp, null) }
                         }
                     }
@@ -629,8 +642,10 @@ fun ConfigTab(cfg: Config, onSave: (Config) -> Unit) {
                     Text("✓ Đã lưu key — không cần nhập lại",
                         fontWeight = FontWeight.SemiBold, color = Color(0xFF1B5E20))
                     when (cfg.provider) {
-                        Provider.GEMINI ->
+                        Provider.GEMINI -> {
                             Text("Gemini: ${mask(cfg.geminiKey)}", fontSize = 13.sp, color = Color(0xFF33691E))
+                            Text("Model: ${Engine.currentModel}", fontSize = 12.sp, color = Color(0xFF558B2F))
+                        }
                         Provider.OPENAI_CLAUDE -> {
                             Text("OpenAI:    ${mask(cfg.openAiKey)}", fontSize = 13.sp, color = Color(0xFF33691E))
                             Text("Anthropic: ${mask(cfg.claudeKey)}", fontSize = 13.sp, color = Color(0xFF33691E))
