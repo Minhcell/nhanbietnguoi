@@ -26,9 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
-import com.google.mlkit.nl.languageid.LanguageIdentification
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
 import org.json.JSONObject
 import java.io.File
 
@@ -52,11 +50,20 @@ fun Root() {
     val speaker = remember { Speaker(ctx) }
     DisposableEffect(Unit) { onDispose { speaker.shutdown() } }
 
-    var openAiKey by remember { mutableStateOf(prefs.getString("openai", "") ?: "") }
-    var claudeKey by remember { mutableStateOf(prefs.getString("claude", "") ?: "") }
-    var tab by remember { mutableIntStateOf(0) }
+    // Đọc cấu hình đã lưu — lần sau mở app không hỏi lại
+    var cfg by remember {
+        mutableStateOf(
+            Config(
+                provider = if (prefs.getString("provider", "GEMINI") == "GEMINI")
+                    Provider.GEMINI else Provider.OPENAI_CLAUDE,
+                geminiKey = prefs.getString("gemini", "") ?: "",
+                openAiKey = prefs.getString("openai", "") ?: "",
+                claudeKey = prefs.getString("claude", "") ?: ""
+            )
+        )
+    }
 
-    // ngôn ngữ đối phương -> dùng chung cho tab hội thoại
+    var tab by remember { mutableIntStateOf(if (cfg.ready) 0 else 2) }
     var theirLang by remember { mutableStateOf("") }
     var theirLangTag by remember { mutableStateOf("en-US") }
 
@@ -68,35 +75,28 @@ fun Root() {
         }
 
         when (tab) {
-            0 -> IdentifyTab(
-                openAiKey = openAiKey, claudeKey = claudeKey, speaker = speaker,
-                onLangDetected = { name, tag -> theirLang = name; theirLangTag = tag }
-            )
-            1 -> ChatTab(
-                openAiKey = openAiKey, claudeKey = claudeKey, speaker = speaker,
-                theirLang = theirLang, theirLangTag = theirLangTag
-            )
-            2 -> ConfigTab(
-                openAiKey, claudeKey,
-                onSave = { o, c ->
-                    openAiKey = o; claudeKey = c
-                    prefs.edit().putString("openai", o).putString("claude", c).apply()
-                }
-            )
+            0 -> IdentifyTab(cfg, speaker) { name, tag ->
+                theirLang = name; theirLangTag = tag
+            }
+            1 -> ChatTab(cfg, speaker, theirLang, theirLangTag)
+            2 -> ConfigTab(cfg) { newCfg ->
+                cfg = newCfg
+                prefs.edit()
+                    .putString("provider", newCfg.provider.name)
+                    .putString("gemini", newCfg.geminiKey)
+                    .putString("openai", newCfg.openAiKey)
+                    .putString("claude", newCfg.claudeKey)
+                    .apply()
+            }
         }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// TAB 1 — NHẬN DIỆN (giọng nói + ảnh giấy tờ/chữ viết)
+// TAB 1 — NHẬN DIỆN
 // ═══════════════════════════════════════════════════════════════
 @Composable
-fun IdentifyTab(
-    openAiKey: String,
-    claudeKey: String,
-    speaker: Speaker,
-    onLangDetected: (String, String) -> Unit
-) {
+fun IdentifyTab(cfg: Config, speaker: Speaker, onLangDetected: (String, String) -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val recorder = remember { Recorder(ctx) }
@@ -104,19 +104,31 @@ fun IdentifyTab(
     var recording by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
+    var seconds by remember { mutableIntStateOf(0) }
 
-    var voice by remember { mutableStateOf<Transcription?>(null) }
+    var audio by remember { mutableStateOf<File?>(null) }
     var images by remember { mutableStateOf<List<ImageEvidence>>(emptyList()) }
     var result by remember { mutableStateOf<JSONObject?>(null) }
 
     var camUri by remember { mutableStateOf<Uri?>(null) }
+    var trigger by remember { mutableIntStateOf(0) }   // tăng lên để tự chạy phân tích
+
+    // Đếm giây khi đang ghi
+    LaunchedEffect(recording) {
+        seconds = 0
+        while (recording) {
+            kotlinx.coroutines.delay(1000)
+            seconds++
+        }
+    }
 
     fun addImage(uri: Uri) {
         val ev = uriToBase64(ctx, uri)
-        if (ev == null) { status = "Không đọc được ảnh này."; return }
-        if (images.size >= 4) { status = "Tối đa 4 ảnh."; return }
-        images = images + ev
-        status = "Đã thêm ảnh (${images.size})."
+        when {
+            ev == null -> status = "Không đọc được ảnh này."
+            images.size >= 4 -> status = "Tối đa 4 ảnh."
+            else -> { images = images + ev; status = "Đã thêm ảnh (${images.size})." }
+        }
     }
 
     val micPerm = rememberLauncherForActivityResult(
@@ -138,50 +150,61 @@ fun IdentifyTab(
     val pickAudio = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri ->
-        if (uri != null) scope.launch {
-            busy = true; status = "Đang nghe file…"
-            try {
-                val f = File(ctx.cacheDir, "in_${System.currentTimeMillis()}.m4a")
+        if (uri != null) {
+            val f = File(ctx.cacheDir, "in_${System.currentTimeMillis()}.wav")
+            runCatching {
                 ctx.contentResolver.openInputStream(uri)?.use { i ->
                     f.outputStream().use { i.copyTo(it) }
                 }
-                voice = Api.transcribe(f, openAiKey.trim())
-                status = "Đã nhận giọng nói."
-            } catch (e: Exception) { status = "Lỗi: ${e.message}" }
-            busy = false
+            }
+            if (f.length() > 1000) { audio = f; trigger++ }
+            else status = "Không đọc được file."
         }
     }
 
-    fun runAnalysis() {
-        if (voice == null && images.isEmpty()) {
-            status = "Cần ít nhất 1 bằng chứng: ghi âm hoặc ảnh giấy tờ/chữ viết."
-            return
+    // Tự động phân tích mỗi khi có bằng chứng mới từ ghi âm
+    LaunchedEffect(trigger) {
+        if (trigger == 0) return@LaunchedEffect
+        if (audio == null && images.isEmpty()) return@LaunchedEffect
+
+        busy = true; result = null
+        try {
+            val r = Engine.analyze(cfg, audio, images) { s -> status = s }
+            result = r
+            onLangDetected(
+                r.optString("ngon_ngu", ""),
+                r.optString("ma_ngon_ngu", "en-US").ifBlank { "en-US" }
+            )
+            status = ""
+        } catch (e: Exception) {
+            status = "Lỗi: ${e.message}"
         }
-        scope.launch {
-            busy = true; result = null; status = "Đang phân tích bằng chứng…"
-            try {
-                val offline = voice?.text?.takeIf { it.isNotBlank() }?.let { identifyOffline(it) }
-                val r = Api.analyze(voice, offline, images, claudeKey.trim())
-                result = r
-                onLangDetected(
-                    r.optString("ngon_ngu", ""),
-                    r.optString("ma_ngon_ngu", "en-US").ifBlank { "en-US" }
-                )
-                status = ""
-            } catch (e: Exception) { status = "Lỗi: ${e.message}" }
-            busy = false
-        }
+        busy = false
     }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("Thu thập bằng chứng", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Thu thập bằng chứng", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text(
+                if (cfg.provider == Provider.GEMINI) "Gemini (free)" else "OpenAI + Claude",
+                fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(top = 6.dp)
+            )
+        }
         Text(
-            "Ghi âm giọng nói và/hoặc chụp giấy tờ, hộ chiếu, visa, chữ viết. Càng nhiều bằng chứng, kết quả càng chắc.",
+            "Ghi âm giọng nói và/hoặc chụp giấy tờ, chữ viết. App tự dò ngôn ngữ và tự phân tích.",
             fontSize = 13.sp, color = Color.Gray
         )
+
+        if (!cfg.ready) {
+            Surface(color = Color(0xFFFFEBEE), shape = MaterialTheme.shapes.small,
+                modifier = Modifier.fillMaxWidth()) {
+                Text("⚠ Chưa cấu hình API key — vào tab Cấu hình.",
+                    Modifier.padding(10.dp), fontSize = 13.sp, color = Color(0xFFB71C1C))
+            }
+        }
 
         // ── Ghi âm ──
         Button(
@@ -189,40 +212,50 @@ fun IdentifyTab(
                 if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO)
                     != PackageManager.PERMISSION_GRANTED
                 ) { micPerm.launch(Manifest.permission.RECORD_AUDIO); return@Button }
-                if (openAiKey.isBlank()) { status = "Chưa có OpenAI key (tab Cấu hình)."; return@Button }
+                if (!cfg.ready) { status = "Chưa cấu hình key."; return@Button }
 
                 if (!recording) {
-                    if (recorder.start()) {
-                        recording = true; status = "Đang ghi… bấm lần nữa để dừng (nên ≥ 8 giây)."
-                    } else status = "Không mở được micro."
+                    if (recorder.start()) { recording = true; status = "" }
+                    else status = "Không mở được micro."
                 } else {
                     recording = false
                     val f = recorder.stop()
                     if (f == null) { status = "Đoạn ghi quá ngắn."; return@Button }
-                    scope.launch {
-                        busy = true; status = "Đang nghe…"
-                        try {
-                            voice = Api.transcribe(f, openAiKey.trim())
-                            status = "Đã nhận giọng nói."
-                        } catch (e: Exception) { status = "Lỗi: ${e.message}" }
-                        busy = false
-                    }
+                    audio = f
+                    trigger++          // tự dò ngôn ngữ + tự phân tích
                 }
             },
-            enabled = !busy,
+            enabled = !busy && cfg.ready,
             colors = ButtonDefaults.buttonColors(
                 containerColor = if (recording) Color(0xFFD32F2F) else MaterialTheme.colorScheme.primary
             ),
-            modifier = Modifier.fillMaxWidth().height(58.dp)
+            modifier = Modifier.fillMaxWidth().height(62.dp)
         ) {
             Icon(if (recording) Icons.Default.Stop else Icons.Default.Mic, null)
             Spacer(Modifier.width(8.dp))
-            Text(if (recording) "DỪNG GHI ÂM" else "GHI ÂM TRỰC TIẾP")
+            Text(
+                if (recording) "DỪNG  •  ${seconds}s" else "GHI ÂM TRỰC TIẾP",
+                fontSize = 16.sp
+            )
+        }
+
+        if (recording) {
+            LinearProgressIndicator(
+                progress = { recorder.level.coerceIn(0.02f, 1f) },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text(
+                if (seconds < 8) "Nói tiếp… nên ghi ít nhất 8 giây để dò ngôn ngữ chắc"
+                else "✓ Đủ dài rồi, có thể dừng",
+                fontSize = 12.sp,
+                color = if (seconds < 8) Color(0xFF9C4221) else Color(0xFF2E7D32)
+            )
         }
 
         OutlinedButton(
             onClick = { pickAudio.launch("audio/*") },
-            enabled = !busy && !recording, modifier = Modifier.fillMaxWidth()
+            enabled = !busy && !recording && cfg.ready,
+            modifier = Modifier.fillMaxWidth()
         ) {
             Icon(Icons.Default.AudioFile, null); Spacer(Modifier.width(8.dp))
             Text("CHỌN FILE GHI ÂM CÓ SẴN")
@@ -242,13 +275,15 @@ fun IdentifyTab(
                     camUri = u
                     takePhoto.launch(u)
                 },
-                enabled = !busy, modifier = Modifier.weight(1f).height(54.dp)
+                enabled = !busy && !recording,
+                modifier = Modifier.weight(1f).height(54.dp)
             ) {
                 Icon(Icons.Default.PhotoCamera, null); Spacer(Modifier.width(6.dp)); Text("CHỤP")
             }
             OutlinedButton(
                 onClick = { pickImage.launch("image/*") },
-                enabled = !busy, modifier = Modifier.weight(1f).height(54.dp)
+                enabled = !busy && !recording,
+                modifier = Modifier.weight(1f).height(54.dp)
             ) {
                 Icon(Icons.Default.Image, null); Spacer(Modifier.width(6.dp)); Text("THÊM ẢNH")
             }
@@ -257,32 +292,30 @@ fun IdentifyTab(
         Surface(color = Color(0xFFE8F4FD), shape = MaterialTheme.shapes.small) {
             Text(
                 "📄 Chụp GIẤY TỜ, HỘ CHIẾU, VISA, CHỮ VIẾT — không phải khuôn mặt. " +
-                        "Trang thông tin hộ chiếu (có mã nước 3 chữ + dòng MRZ ở đáy) là bằng chứng mạnh nhất.",
+                        "Trang thông tin hộ chiếu (mã nước 3 chữ + dòng MRZ ở đáy) là bằng chứng mạnh nhất.",
                 Modifier.padding(10.dp), fontSize = 12.sp, color = Color(0xFF0B4A6F)
             )
         }
 
-        // ── Trạng thái bằng chứng ──
+        // ── Bằng chứng ──
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("Bằng chứng hiện có", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                Text(
-                    if (voice != null) "🎤 Giọng nói: ${voice!!.language} — \"${voice!!.text.take(60)}…\""
-                    else "🎤 Giọng nói: chưa có",
-                    fontSize = 13.sp
-                )
+                Text(if (audio != null) "🎤 Có ghi âm" else "🎤 Chưa có ghi âm", fontSize = 13.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("🖼 Ảnh: ${images.size}", fontSize = 13.sp)
                     if (images.isNotEmpty()) {
-                        TextButton(onClick = { images = emptyList() }) { Text("Xoá hết", fontSize = 12.sp) }
+                        TextButton(onClick = { images = emptyList() }) {
+                            Text("Xoá hết", fontSize = 12.sp)
+                        }
                     }
                 }
             }
         }
 
         Button(
-            onClick = { runAnalysis() },
-            enabled = !busy && !recording && claudeKey.isNotBlank(),
+            onClick = { trigger++ },
+            enabled = !busy && !recording && cfg.ready && (audio != null || images.isNotEmpty()),
             modifier = Modifier.fillMaxWidth().height(58.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
         ) {
@@ -312,13 +345,19 @@ private fun ResultCard(r: JSONObject, speaker: Speaker) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
 
-            Text(
-                r.optString("ket_luan", "?"),
-                fontSize = 24.sp, fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Text("Độ tin cậy: ${r.optString("do_tin_cay")}", fontSize = 13.sp, color = Color.Gray)
+            Text(r.optString("ket_luan", "?"), fontSize = 24.sp, fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary)
+            Text("Độ tin cậy: ${r.optString("do_tin_cay")}  •  Nguồn: ${r.optString("nguon_phan_tich")}",
+                fontSize = 13.sp, color = Color.Gray)
             Text(r.optString("ly_do"), fontSize = 14.sp)
+
+            val loi = r.optString("loi_noi")
+            if (loi.isNotBlank() && loi != "null") {
+                Surface(color = Color(0xFFF5F5F5), shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth()) {
+                    Text("\"$loi\"", Modifier.padding(10.dp), fontSize = 14.sp)
+                }
+            }
 
             HorizontalDivider()
 
@@ -367,7 +406,7 @@ private fun ResultCard(r: JSONObject, speaker: Speaker) {
                         IconButton(onClick = {
                             speaker.speak(target, langTag) {
                                 android.widget.Toast.makeText(
-                                    ctx, "Máy chưa cài giọng đọc cho ngôn ngữ này", 
+                                    ctx, "Máy chưa cài giọng đọc cho ngôn ngữ này",
                                     android.widget.Toast.LENGTH_SHORT
                                 ).show()
                             }
@@ -393,51 +432,40 @@ private fun ResultCard(r: JSONObject, speaker: Speaker) {
 // ═══════════════════════════════════════════════════════════════
 // TAB 2 — HỘI THOẠI 2 CHIỀU
 // ═══════════════════════════════════════════════════════════════
-data class Turn(val whoIsForeigner: Boolean, val original: String, val translated: String)
+data class Turn(val foreigner: Boolean, val original: String, val translated: String)
 
 @Composable
-fun ChatTab(
-    openAiKey: String, claudeKey: String, speaker: Speaker,
-    theirLang: String, theirLangTag: String
-) {
+fun ChatTab(cfg: Config, speaker: Speaker, theirLang: String, theirLangTag: String) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val recorder = remember { Recorder(ctx) }
 
     var turns by remember { mutableStateOf<List<Turn>>(emptyList()) }
     var busy by remember { mutableStateOf(false) }
-    var recordingForeigner by remember { mutableStateOf<Boolean?>(null) }
+    var who by remember { mutableStateOf<Boolean?>(null) }   // null = không ghi
     var status by remember { mutableStateOf("") }
 
     val lang = theirLang.ifBlank { "tiếng Anh" }
 
     fun handle(isForeigner: Boolean) {
-        if (recordingForeigner == null) {
+        if (who == null) {
             if (recorder.start()) {
-                recordingForeigner = isForeigner
+                who = isForeigner
                 status = if (isForeigner) "Đang nghe họ nói…" else "Đang nghe anh nói…"
             } else status = "Không mở được micro."
             return
         }
         val f = recorder.stop()
-        val wasForeigner = recordingForeigner!!
-        recordingForeigner = null
+        val wasForeigner = who!!
+        who = null
         if (f == null) { status = "Đoạn ghi quá ngắn."; return }
 
         scope.launch {
             busy = true; status = "Đang dịch…"
             try {
-                // anh nói -> ép nhận tiếng Việt cho chính xác; họ nói -> để máy tự dò
-                val t = Api.transcribe(f, openAiKey.trim(), if (wasForeigner) null else "vi")
-                if (t.text.isBlank()) { status = "Không nghe rõ."; busy = false; return@launch }
-
-                val translated = Api.translate(
-                    t.text, lang, toVietnamese = wasForeigner, claudeKey = claudeKey.trim()
-                )
-                turns = turns + Turn(wasForeigner, t.text, translated)
-
-                // đọc bản dịch lên: họ nói -> đọc tiếng Việt; anh nói -> đọc tiếng họ
-                speaker.speak(translated, if (wasForeigner) "vi-VN" else theirLangTag)
+                val (orig, trans) = Engine.chatTurn(cfg, f, wasForeigner, lang)
+                turns = turns + Turn(wasForeigner, orig, trans)
+                speaker.speak(trans, if (wasForeigner) "vi-VN" else theirLangTag)
                 status = ""
             } catch (e: Exception) { status = "Lỗi: ${e.message}" }
             busy = false
@@ -446,35 +474,37 @@ fun ChatTab(
 
     Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("Hội thoại 2 chiều", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Text("Ngôn ngữ đối phương: $lang" +
-                if (theirLang.isBlank()) " (chạy tab Nhận diện trước để tự nhận)" else "",
-            fontSize = 13.sp, color = Color.Gray)
+        Text(
+            "Ngôn ngữ đối phương: $lang" +
+                    if (theirLang.isBlank()) " (chạy tab Nhận diện trước để tự nhận)" else "",
+            fontSize = 13.sp, color = Color.Gray
+        )
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = { handle(true) },
-                enabled = !busy && recordingForeigner != false,
+                enabled = !busy && who != false && cfg.ready,
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (recordingForeigner == true) Color(0xFFD32F2F) else Color(0xFF1565C0)
+                    containerColor = if (who == true) Color(0xFFD32F2F) else Color(0xFF1565C0)
                 ),
-                modifier = Modifier.weight(1f).height(72.dp)
+                modifier = Modifier.weight(1f).height(76.dp)
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(if (recordingForeigner == true) Icons.Default.Stop else Icons.Default.RecordVoiceOver, null)
-                    Text(if (recordingForeigner == true) "DỪNG" else "HỌ NÓI", fontSize = 13.sp)
+                    Icon(if (who == true) Icons.Default.Stop else Icons.Default.RecordVoiceOver, null)
+                    Text(if (who == true) "DỪNG" else "HỌ NÓI", fontSize = 13.sp)
                 }
             }
             Button(
                 onClick = { handle(false) },
-                enabled = !busy && recordingForeigner != true,
+                enabled = !busy && who != true && cfg.ready,
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (recordingForeigner == false) Color(0xFFD32F2F) else Color(0xFF2E7D32)
+                    containerColor = if (who == false) Color(0xFFD32F2F) else Color(0xFF2E7D32)
                 ),
-                modifier = Modifier.weight(1f).height(72.dp)
+                modifier = Modifier.weight(1f).height(76.dp)
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(if (recordingForeigner == false) Icons.Default.Stop else Icons.Default.Mic, null)
-                    Text(if (recordingForeigner == false) "DỪNG" else "TÔI NÓI", fontSize = 13.sp)
+                    Icon(if (who == false) Icons.Default.Stop else Icons.Default.Mic, null)
+                    Text(if (who == false) "DỪNG" else "TÔI NÓI", fontSize = 13.sp)
                 }
             }
         }
@@ -488,17 +518,19 @@ fun ChatTab(
             Text(status, fontSize = 13.sp, color = Color(0xFF9C4221))
         }
 
-        Column(Modifier.weight(1f).verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(
+            Modifier.weight(1f).verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             turns.reversed().forEach { t ->
                 Card(
                     Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(
-                        containerColor = if (t.whoIsForeigner) Color(0xFFE3F2FD) else Color(0xFFE8F5E9)
+                        containerColor = if (t.foreigner) Color(0xFFE3F2FD) else Color(0xFFE8F5E9)
                     )
                 ) {
                     Column(Modifier.padding(12.dp)) {
-                        Text(if (t.whoIsForeigner) "HỌ" else "TÔI",
+                        Text(if (t.foreigner) "HỌ" else "TÔI",
                             fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
                         Text(t.original, fontSize = 14.sp, color = Color.DarkGray)
                         Spacer(Modifier.height(4.dp))
@@ -506,10 +538,8 @@ fun ChatTab(
                             Text(t.translated, fontSize = 16.sp,
                                 fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
                             IconButton(onClick = {
-                                speaker.speak(
-                                    t.translated,
-                                    if (t.whoIsForeigner) "vi-VN" else theirLangTag
-                                )
+                                speaker.speak(t.translated,
+                                    if (t.foreigner) "vi-VN" else theirLangTag)
                             }) { Icon(Icons.Default.VolumeUp, null) }
                         }
                     }
@@ -523,37 +553,190 @@ fun ChatTab(
 // TAB 3 — CẤU HÌNH
 // ═══════════════════════════════════════════════════════════════
 @Composable
-fun ConfigTab(openAi: String, claude: String, onSave: (String, String) -> Unit) {
-    var o by remember { mutableStateOf(openAi) }
-    var c by remember { mutableStateOf(claude) }
+fun ConfigTab(cfg: Config, onSave: (Config) -> Unit) {
+    var provider by remember { mutableStateOf(cfg.provider) }
+    var gk by remember { mutableStateOf(cfg.geminiKey) }
+    var ok by remember { mutableStateOf(cfg.openAiKey) }
+    var ck by remember { mutableStateOf(cfg.claudeKey) }
     var msg by remember { mutableStateOf("") }
+    var editing by remember { mutableStateOf(!cfg.ready) }
 
-    Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("Cấu hình API", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        OutlinedTextField(o, { o = it }, label = { Text("OpenAI key (Whisper)") },
-            singleLine = true, visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(c, { c = it }, label = { Text("Anthropic key (Claude)") },
-            singleLine = true, visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth())
-        Button(onClick = { onSave(o.trim(), c.trim()); msg = "Đã lưu." },
-            modifier = Modifier.fillMaxWidth()) { Text("LƯU") }
-        if (msg.isNotBlank()) Text(msg, color = Color(0xFF2E7D32))
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text("Cấu hình", fontSize = 20.sp, fontWeight = FontWeight.Bold)
 
-        Spacer(Modifier.height(10.dp))
+        // ── Chọn nhà cung cấp ──
+        Text("Chọn nhà cung cấp AI", fontWeight = FontWeight.SemiBold)
+
+        Card(
+            Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = if (provider == Provider.GEMINI) Color(0xFFE8F5E9) else Color(0xFFF5F5F5)
+            )
+        ) {
+            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(provider == Provider.GEMINI, { provider = Provider.GEMINI; editing = true })
+                Column(Modifier.weight(1f)) {
+                    Text("Gemini — MIỄN PHÍ", fontWeight = FontWeight.SemiBold)
+                    Text("1 key duy nhất, không cần thẻ. 250 lượt/ngày.",
+                        fontSize = 12.sp, color = Color.Gray)
+                }
+            }
+        }
+
+        Card(
+            Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = if (provider == Provider.OPENAI_CLAUDE) Color(0xFFE3F2FD) else Color(0xFFF5F5F5)
+            )
+        ) {
+            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(provider == Provider.OPENAI_CLAUDE, {
+                    provider = Provider.OPENAI_CLAUDE; editing = true
+                })
+                Column(Modifier.weight(1f)) {
+                    Text("OpenAI + Claude — TRẢ PHÍ", fontWeight = FontWeight.SemiBold)
+                    Text("2 key, nạp ~5 USD. Không dùng dữ liệu để huấn luyện.",
+                        fontSize = 12.sp, color = Color.Gray)
+                }
+            }
+        }
+
+        // ── Cảnh báo riêng cho Gemini free ──
+        if (provider == Provider.GEMINI) {
+            Surface(color = Color(0xFFFFEBEE), shape = MaterialTheme.shapes.small,
+                modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    "🔴 QUAN TRỌNG — Gemini bản miễn phí:\n" +
+                    "Google được phép dùng dữ liệu anh gửi lên để huấn luyện model. " +
+                    "Nghĩa là ẢNH HỘ CHIẾU / VISA của người khác cũng có thể bị dùng để huấn luyện.\n\n" +
+                    "Nếu chỉ dùng phần GIỌNG NÓI thì rủi ro thấp. " +
+                    "Nếu chụp GIẤY TỜ của người khác, nên chuyển sang OpenAI + Claude (trả phí, không train trên dữ liệu API).",
+                    Modifier.padding(12.dp), fontSize = 12.sp, color = Color(0xFFB71C1C)
+                )
+            }
+        }
+
+        HorizontalDivider()
+
+        val saved = cfg.ready
+        if (saved && !editing) {
+            Surface(color = Color(0xFFE8F5E9), shape = MaterialTheme.shapes.small,
+                modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("✓ Đã lưu key — không cần nhập lại",
+                        fontWeight = FontWeight.SemiBold, color = Color(0xFF1B5E20))
+                    when (cfg.provider) {
+                        Provider.GEMINI ->
+                            Text("Gemini: ${mask(cfg.geminiKey)}", fontSize = 13.sp, color = Color(0xFF33691E))
+                        Provider.OPENAI_CLAUDE -> {
+                            Text("OpenAI:    ${mask(cfg.openAiKey)}", fontSize = 13.sp, color = Color(0xFF33691E))
+                            Text("Anthropic: ${mask(cfg.claudeKey)}", fontSize = 13.sp, color = Color(0xFF33691E))
+                        }
+                    }
+                }
+            }
+            OutlinedButton(onClick = { editing = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("ĐỔI KEY")
+            }
+        } else {
+            if (provider == Provider.GEMINI) {
+                OutlinedTextField(gk, { gk = it },
+                    label = { Text("Gemini API key (bắt đầu bằng AIza…)") },
+                    singleLine = true, visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth())
+            } else {
+                OutlinedTextField(ok, { ok = it },
+                    label = { Text("OpenAI key (sk-…)") },
+                    singleLine = true, visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(ck, { ck = it },
+                    label = { Text("Anthropic key (sk-ant-…)") },
+                    singleLine = true, visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth())
+            }
+
+            Button(
+                onClick = {
+                    val c = Config(provider, gk.trim(), ok.trim(), ck.trim())
+                    if (!c.ready) {
+                        msg = if (provider == Provider.GEMINI) "Cần nhập Gemini key."
+                        else "Cần đủ cả 2 key."
+                        return@Button
+                    }
+                    onSave(c)
+                    editing = false
+                    msg = "Đã lưu. Lần sau mở app không cần nhập lại."
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("LƯU") }
+        }
+
+        if (msg.isNotBlank()) Text(msg, color = Color(0xFF2E7D32), fontSize = 13.sp)
+
+        HorizontalDivider()
+
+        // ── Hướng dẫn lấy key ──
+        Text("Lấy key ở đâu", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text("Gemini (MIỄN PHÍ — 1 key)", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                Text(
+                    "• Vào aistudio.google.com\n" +
+                    "• Đăng nhập bằng tài khoản Google\n" +
+                    "• Bấm \"Get API key\" → \"Create API key\"\n" +
+                    "• Copy chuỗi bắt đầu bằng AIza…\n" +
+                    "• KHÔNG cần thẻ tín dụng, KHÔNG hết hạn\n" +
+                    "• Hạn mức: 250 lượt/ngày, 10 lượt/phút",
+                    fontSize = 13.sp, color = Color.Gray
+                )
+            }
+        }
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text("OpenAI + Anthropic (TRẢ PHÍ — 2 key)",
+                    fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                Text(
+                    "OpenAI (Whisper — nghe giọng nói):\n" +
+                    "• platform.openai.com → API keys → Create new secret key\n" +
+                    "• Copy chuỗi sk-… (chỉ hiện MỘT LẦN)\n" +
+                    "• Billing → nạp tối thiểu 5 USD\n" +
+                    "• Giá ~0,006 USD/phút → 5 USD ≈ 800 phút ghi âm\n\n" +
+                    "Anthropic (Claude — đọc giấy tờ, phân tích, dịch):\n" +
+                    "• console.anthropic.com → Settings → API Keys → Create Key\n" +
+                    "• Copy chuỗi sk-ant-… (chỉ hiện MỘT LẦN)\n" +
+                    "• Plans & Billing → nạp tiền",
+                    fontSize = 13.sp, color = Color.Gray
+                )
+            }
+        }
+
+        Surface(color = Color(0xFFFFF3CD), shape = MaterialTheme.shapes.small,
+            modifier = Modifier.fillMaxWidth()) {
+            Text("🔒 Key lưu trong bộ nhớ riêng của app, không gửi đi đâu ngoài chính nhà cung cấp. " +
+                    "Gỡ app là mất, cài lại phải nhập lại.",
+                Modifier.padding(10.dp), fontSize = 12.sp, color = Color(0xFF664D03))
+        }
+
+        HorizontalDivider()
+
         Text("Mẹo dùng", fontWeight = FontWeight.SemiBold)
         Text(
-            "• Ghi âm ít nhất 8 giây thì máy mới dò ngôn ngữ chắc.\n" +
-            "• Ảnh mạnh nhất: trang thông tin hộ chiếu (có mã nước 3 chữ như BGD/IND/PAK và dòng MRZ ở đáy), visa, thẻ cư trú.\n" +
-            "• Ảnh chữ viết tay hay tin nhắn trên điện thoại cũng rất tốt — hệ chữ Bengali khác hẳn Hindi/Urdu.\n" +
-            "• Kết hợp cả giọng nói và ảnh sẽ cho kết quả chắc nhất.\n" +
-            "• Giọng đọc TTS cho Bengali/Urdu có thể chưa cài sẵn — vào Cài đặt Android > Ngôn ngữ > Đầu ra văn bản thành giọng nói để tải thêm.",
+            "• Ghi âm ít nhất 8 giây — app TỰ dò ngôn ngữ và TỰ phân tích ngay sau khi dừng.\n" +
+            "• Hỗ trợ mọi ngôn ngữ trên thế giới (Bengali, Pashto, Amhara, Wolof, Sinhala…).\n" +
+            "• Chỉ ảnh → đọc chữ/giấy tờ. Chỉ giọng → phân tích ngôn ngữ. Cả hai → đối chiếu chéo.\n" +
+            "• Ảnh mạnh nhất: trang thông tin hộ chiếu (mã nước 3 chữ + dòng MRZ ở đáy).\n" +
+            "• Giọng đọc TTS Bengali/Urdu có thể chưa có — vào Cài đặt Android > Ngôn ngữ > Text-to-speech để tải thêm.",
             fontSize = 13.sp, color = Color.Gray
         )
+        Spacer(Modifier.height(30.dp))
     }
 }
 
-private suspend fun identifyOffline(text: String): String = try {
-    val code = LanguageIdentification.getClient().identifyLanguage(text).await()
-    if (code == "und") "không xác định" else code
-} catch (e: Exception) { "không chạy được" }
+private fun mask(k: String): String =
+    if (k.length <= 12) "••••••••"
+    else "${k.take(6)}••••••••${k.takeLast(4)}"
