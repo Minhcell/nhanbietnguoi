@@ -43,7 +43,25 @@ object Engine {
         .build()
 
     private val JSON = "application/json; charset=utf-8".toMediaType()
-    private const val GEMINI_MODEL = "gemini-2.5-flash"
+
+    /**
+     * Google khai tử model rất nhanh (2.5-flash đã chặn tài khoản mới → lỗi 404).
+     * Nên thử lần lượt theo thứ tự ưu tiên; nếu hỏng hết thì HỎI THẲNG Google
+     * xem tài khoản này đang dùng được model nào (ListModels).
+     */
+    private val GEMINI_CANDIDATES = listOf(
+        "gemini-3-flash-preview",        // có free tier (tài liệu Google, 7/2026)
+        "gemini-3.1-flash-lite-preview", // free tier, rẻ và nhanh
+        "gemini-2.5-flash-lite",         // đời cũ, vẫn còn free
+        "gemini-flash-latest"            // alias trỏ tới bản Flash mới nhất
+    )
+
+    /** Model đã xác nhận chạy được — lưu lại để khỏi dò lại mỗi lần gọi. */
+    @Volatile
+    private var workingModel: String? = null
+
+    /** Tên model đang dùng, để hiển thị lên giao diện. */
+    val currentModel: String get() = workingModel ?: "đang dò…"
 
     // ═══════════════════════════════════════════════════════════
     // PHÂN TÍCH — luồng chính
@@ -197,6 +215,129 @@ Trả về DUY NHẤT một object JSON:
         images: List<ImageEvidence>
     ): JSONObject = withContext(Dispatchers.IO) {
 
+        val payload = buildGeminiPayload(prompt, audio, images)
+
+        // Đã biết model nào chạy được -> dùng luôn
+        workingModel?.let { m ->
+            return@withContext postGemini(key, m, payload)
+        }
+
+        // Chưa biết -> thử lần lượt danh sách ưu tiên
+        var lastError: Exception? = null
+        for (model in GEMINI_CANDIDATES) {
+            try {
+                val r = postGemini(key, model, payload)
+                workingModel = model          // nhớ lại, lần sau khỏi dò
+                return@withContext r
+            } catch (e: ModelNotFound) {
+                lastError = e                 // model chết -> thử cái kế tiếp
+            }
+        }
+
+        // Cả danh sách đều chết -> hỏi thẳng Google xem tài khoản này dùng được gì
+        val discovered = discoverModel(key)
+            ?: throw RuntimeException(
+                "Không tìm được model Gemini nào khả dụng cho key này. " +
+                        "Lỗi cuối: ${lastError?.message}"
+            )
+
+        val r = postGemini(key, discovered, payload)
+        workingModel = discovered
+        r
+    }
+
+    /** Lỗi riêng cho trường hợp model không tồn tại / bị khai tử (404). */
+    private class ModelNotFound(msg: String) : Exception(msg)
+
+    private fun postGemini(key: String, model: String, payload: JSONObject): JSONObject {
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/" +
+                "$model:generateContent?key=$key"
+
+        val req = Request.Builder()
+            .url(url)
+            .post(payload.toString().toRequestBody(JSON))
+            .build()
+
+        http.newCall(req).execute().use { res ->
+            val raw = res.body?.string().orEmpty()
+
+            if (!res.isSuccessful) {
+                if (res.code == 404) throw ModelNotFound("Model $model không còn khả dụng")
+
+                val hint = when (res.code) {
+                    429 -> "Hết hạn mức miễn phí hôm nay. Chờ sang ngày mới (reset 14h giờ VN) " +
+                            "hoặc đổi sang OpenAI + Claude."
+                    400 -> "Key sai định dạng, hoặc file gửi lên quá lớn. Thử ghi âm ngắn hơn."
+                    403 -> "Key không hợp lệ hoặc chưa bật Gemini API cho key này."
+                    else -> raw.take(200)
+                }
+                throw RuntimeException("Gemini lỗi ${res.code}: $hint")
+            }
+
+            val text = JSONObject(raw)
+                .getJSONArray("candidates").getJSONObject(0)
+                .getJSONObject("content").getJSONArray("parts")
+                .getJSONObject(0).getString("text")
+                .replace("```json", "").replace("```", "").trim()
+
+            return JSONObject(text)
+        }
+    }
+
+    /**
+     * Hỏi Google: key này đang dùng được những model nào?
+     * Chọn model Flash mới nhất có hỗ trợ generateContent.
+     * Nhờ vậy sau này Google đổi tên model, app vẫn tự thích nghi.
+     */
+    private fun discoverModel(key: String): String? {
+        val req = Request.Builder()
+            .url("https://generativelanguage.googleapis.com/v1beta/models?key=$key&pageSize=200")
+            .get()
+            .build()
+
+        http.newCall(req).execute().use { res ->
+            if (!res.isSuccessful) return null
+            val arr = JSONObject(res.body?.string().orEmpty()).optJSONArray("models") ?: return null
+
+            val usable = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val m = arr.getJSONObject(i)
+                val name = m.optString("name").removePrefix("models/")
+                val methods = m.optJSONArray("supportedGenerationMethods")
+
+                var canGenerate = false
+                if (methods != null) {
+                    for (j in 0 until methods.length()) {
+                        if (methods.getString(j) == "generateContent") { canGenerate = true; break }
+                    }
+                }
+                // bỏ qua model sinh ảnh / video / TTS / embedding
+                val isText = !name.contains("image") && !name.contains("veo") &&
+                        !name.contains("tts") && !name.contains("embedding") &&
+                        !name.contains("imagen")
+
+                if (canGenerate && isText) usable += name
+            }
+
+            // ưu tiên Flash (rẻ + có free tier), số đời cao hơn xếp trước
+            return usable.filter { it.contains("flash") }.maxByOrNull { versionScore(it) }
+                ?: usable.maxByOrNull { versionScore(it) }
+        }
+    }
+
+    /** "gemini-3.1-flash-lite" -> 31 ; dùng để chọn đời model cao nhất. */
+    private fun versionScore(name: String): Int {
+        val m = Regex("""gemini-(\d+)(?:\.(\d+))?""").find(name) ?: return 0
+        val major = m.groupValues[1].toIntOrNull() ?: 0
+        val minor = m.groupValues[2].toIntOrNull() ?: 0
+        return major * 10 + minor
+    }
+
+    private fun buildGeminiPayload(
+        prompt: String,
+        audio: File?,
+        images: List<ImageEvidence>
+    ): JSONObject {
         val parts = JSONArray()
 
         audio?.let { f ->
@@ -220,42 +361,13 @@ Trả về DUY NHẤT một object JSON:
 
         parts.put(JSONObject().put("text", prompt))
 
-        val payload = JSONObject().apply {
+        return JSONObject().apply {
             put("contents", JSONArray().put(JSONObject().put("parts", parts)))
             put("generationConfig", JSONObject().apply {
                 put("responseMimeType", "application/json")   // ép trả JSON thuần
                 put("temperature", 0.2)
                 put("maxOutputTokens", 2500)
             })
-        }
-
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/" +
-                "$GEMINI_MODEL:generateContent?key=$key"
-
-        val req = Request.Builder()
-            .url(url)
-            .post(payload.toString().toRequestBody(JSON))
-            .build()
-
-        http.newCall(req).execute().use { res ->
-            val raw = res.body?.string().orEmpty()
-            if (!res.isSuccessful) {
-                val hint = when (res.code) {
-                    429 -> "Hết hạn mức miễn phí hôm nay (250 lượt/ngày). Chờ sang ngày mới hoặc đổi sang OpenAI+Claude."
-                    400 -> "Key sai hoặc file quá lớn. Thử ghi âm ngắn hơn."
-                    403 -> "Key không hợp lệ."
-                    else -> raw.take(200)
-                }
-                throw RuntimeException("Gemini lỗi ${res.code}: $hint")
-            }
-
-            val text = JSONObject(raw)
-                .getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content").getJSONArray("parts")
-                .getJSONObject(0).getString("text")
-                .replace("```json", "").replace("```", "").trim()
-
-            JSONObject(text)
         }
     }
 
