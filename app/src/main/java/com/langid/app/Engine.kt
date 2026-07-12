@@ -101,42 +101,46 @@ object Engine {
     // ═══════════════════════════════════════════════════════════
     // HỘI THOẠI 2 CHIỀU — 1 lượt nói
     // ═══════════════════════════════════════════════════════════
-    /** @return Pair(câu gốc, bản dịch) */
+    /**
+     * Một lượt nói trong hội thoại.
+     * @param from  ngôn ngữ người đang nói (isAuto = để máy tự dò)
+     * @param to    ngôn ngữ cần dịch sang
+     * @return Pair(nguyên văn, bản dịch)
+     */
     suspend fun chatTurn(
         cfg: Config,
         audio: File,
-        foreignerSpeaking: Boolean,
-        theirLanguage: String
+        from: LangOption,
+        to: LangOption
     ): Pair<String, String> = when (cfg.provider) {
 
         Provider.OPENAI_CLAUDE -> {
-            val t = Api.transcribe(
-                audio, cfg.openAiKey,
-                forceLanguage = if (foreignerSpeaking) null else "vi"
-            )
-            if (t.text.isBlank()) throw RuntimeException("Không nghe rõ.")
-            val tr = Api.translate(t.text, theirLanguage, foreignerSpeaking, cfg.claudeKey)
+            // Chọn sẵn ngôn ngữ -> ép Whisper -> nhanh + chính xác hơn (hết lỗi dò sai)
+            val t = Api.transcribe(audio, cfg.openAiKey, forceLanguage = from.iso)
+            if (t.text.isBlank()) throw RuntimeException("Không nghe rõ, thử nói lại.")
+            val tr = Api.translate(t.text, to.display, toVietnamese = to.iso == "vi", cfg.claudeKey)
             t.text to tr
         }
 
         Provider.GEMINI -> {
-            val instruction = if (foreignerSpeaking)
-                "Đoạn ghi âm là một người nước ngoài (đang nói $theirLanguage) đang nói. " +
-                        "Hãy chép lại nguyên văn lời họ nói, rồi dịch sang tiếng Việt."
+            val fromDesc = if (from.isAuto)
+                "Hãy TỰ ĐỘNG phát hiện ngôn ngữ người nói (có thể là bất kỳ ngôn ngữ nào trên thế giới, kể cả Bengali/tiếng Bangladesh)."
             else
-                "Đoạn ghi âm là một người Việt đang nói tiếng Việt. " +
-                        "Hãy chép lại nguyên văn, rồi dịch sang $theirLanguage " +
-                        "(dùng chữ viết gốc của ngôn ngữ đó, không phiên âm)."
+                "Người nói đang dùng ${from.display}."
 
             val prompt = """
-$instruction
+$fromDesc
 
-Trả về DUY NHẤT một object JSON:
-{"gốc": "nguyên văn lời nói", "dịch": "bản dịch"}
+Nhiệm vụ:
+1. Chép lại NGUYÊN VĂN lời nói trong đoạn ghi âm.
+2. Dịch sang ${to.display}${if (to.iso == "vi") "" else " (dùng chữ viết gốc của ngôn ngữ đó, không phiên âm)"}.
+
+Trả về DUY NHẤT một object JSON, không markdown:
+{"goc": "nguyên văn lời nói", "dich": "bản dịch"}
             """.trimIndent()
 
             val r = geminiCall(cfg.geminiKey, prompt, audio, emptyList())
-            r.optString("gốc", "") to r.optString("dịch", "")
+            r.optString("goc", "") to r.optString("dich", "")
         }
     }
 
@@ -253,25 +257,53 @@ Trả về DUY NHẤT một object JSON:
         val url = "https://generativelanguage.googleapis.com/v1beta/models/" +
                 "$model:generateContent?key=$key"
 
+        // Lỗi 5xx (500/502/503/505) và lỗi mạng thường là tạm thời -> thử lại
+        var attempt = 0
+        while (true) {
+            try {
+                return postGeminiOnce(url, payload)
+            } catch (e: ModelNotFound) {
+                throw e                          // 404 thì đừng thử lại, để nhảy sang model khác
+            } catch (e: RetryableError) {
+                attempt++
+                if (attempt >= 3) throw RuntimeException(
+                    "Mạng lỗi ${e.code} sau ${attempt} lần thử. " +
+                    "Kiểm tra mạng rồi ghi âm lại. (Nếu đang dùng VPN/proxy thì tắt đi.)"
+                )
+                Thread.sleep(700L * attempt)     // 0.7s, 1.4s
+            }
+        }
+    }
+
+    private class RetryableError(val code: Int) : Exception("HTTP $code")
+
+    private fun postGeminiOnce(url: String, payload: JSONObject): JSONObject {
         val req = Request.Builder()
             .url(url)
             .post(payload.toString().toRequestBody(JSON))
             .build()
 
-        http.newCall(req).execute().use { res ->
-            val raw = res.body?.string().orEmpty()
+        val res = try {
+            http.newCall(req).execute()
+        } catch (e: java.io.IOException) {
+            throw RetryableError(0)              // mất mạng giữa chừng -> thử lại
+        }
 
-            if (!res.isSuccessful) {
-                if (res.code == 404) throw ModelNotFound("Model $model không còn khả dụng")
+        res.use { r ->
+            val raw = r.body?.string().orEmpty()
 
-                val hint = when (res.code) {
+            if (!r.isSuccessful) {
+                if (r.code == 404) throw ModelNotFound("Model không còn khả dụng")
+                if (r.code in 500..599) throw RetryableError(r.code)   // 500/502/503/505...
+
+                val hint = when (r.code) {
                     429 -> "Hết hạn mức miễn phí hôm nay. Chờ sang ngày mới (reset 14h giờ VN) " +
                             "hoặc đổi sang OpenAI + Claude."
                     400 -> "Key sai định dạng, hoặc file gửi lên quá lớn. Thử ghi âm ngắn hơn."
                     403 -> "Key không hợp lệ hoặc chưa bật Gemini API cho key này."
                     else -> raw.take(200)
                 }
-                throw RuntimeException("Gemini lỗi ${res.code}: $hint")
+                throw RuntimeException("Gemini lỗi ${r.code}: $hint")
             }
 
             val text = JSONObject(raw)
