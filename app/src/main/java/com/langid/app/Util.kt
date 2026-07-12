@@ -6,11 +6,18 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.AudioManager
+import okhttp3.Request
+import okhttp3.OkHttpClient
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import android.media.MediaPlayer
+import android.media.AudioAttributes
 import android.net.Uri
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
-import android.os.Looper
-import android.os.Handler
 import android.util.Base64
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayOutputStream
@@ -68,148 +75,175 @@ fun newImageFile(ctx: Context): File =
     File(ctx.cacheDir, "shot_${System.currentTimeMillis()}.jpg")
 
 /**
- * Phát âm bằng TextToSpeech — bản chống câm.
+ * Phát âm HOẠT ĐỘNG NHƯ GOOGLE DỊCH.
  *
- * Vì sao bản trước bấm loa vẫn im mà KHÔNG báo lỗi:
- *   isLanguageAvailable() trả "có" ngay cả khi giọng đọc là loại tải qua mạng
- *   CHƯA cài. speak() khi đó trả SUCCESS nhưng thực tế không ra tiếng.
+ * Không dùng giọng đọc cài trên máy (Xiaomi hay câm với Bengali/Urdu),
+ * mà tải thẳng audio MP3 từ endpoint TTS của Google — đúng thứ Google Dịch dùng —
+ * rồi phát bằng MediaPlayer. Nhờ vậy MỌI ngôn ngữ đều phát được, KHÔNG cần cài gì.
  *
- * Bản này lắng nghe KẾT QUẢ TỔNG HỢP THẬT qua UtteranceProgressListener:
- *   - onStart  -> đang phát (ổn)
- *   - onDone   -> phát xong (ổn)
- *   - onError  -> câm thật -> báo cho người dùng cài giọng đọc
- * Mọi callback được đẩy về luồng chính để hiện Toast an toàn.
+ * Cần mạng (app vốn đã cần mạng để dịch nên không phát sinh yêu cầu mới).
+ * Nếu mạng lỗi -> tự lùi về giọng đọc của máy.
  */
 class Speaker(context: Context) {
 
     private val appCtx = context.applicationContext
-    private val main = Handler(Looper.getMainLooper())
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
-    @Volatile private var ready = false
-    private var tts: TextToSpeech? = null
+    private var player: MediaPlayer? = null
 
-    // map utteranceId -> callback báo kết quả
-    private val callbacks = java.util.concurrent.ConcurrentHashMap<String, (String?) -> Unit>()
-    @Volatile private var startedIds = java.util.Collections.synchronizedSet(HashSet<String>())
+    // Giọng đọc máy — chỉ dùng dự phòng khi mạng lỗi
+    @Volatile private var ttsReady = false
+    private val tts = TextToSpeech(appCtx) { ttsReady = it == TextToSpeech.SUCCESS }
 
-    private var queued: Triple<String, String, (String?) -> Unit>? = null
+    private val http = OkHttpClient.Builder()
+        .callTimeout(25, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 
-    init {
-        tts = TextToSpeech(appCtx) { status ->
-            ready = status == TextToSpeech.SUCCESS
-            if (ready) {
-                tts?.setSpeechRate(0.9f)
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) {
-                        if (id != null) startedIds.add(id)
-                    }
-                    override fun onDone(id: String?) {
-                        val cb = callbacks.remove(id)
-                        startedIds.remove(id)
-                        // onDone mà chưa từng onStart => nhiều máy = câm
-                        main.post { cb?.invoke(null) }
-                    }
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(id: String?) {
-                        val cb = callbacks.remove(id)
-                        startedIds.remove(id)
-                        main.post { cb?.invoke("Máy không phát được giọng này. Bấm CÀI GIỌNG ĐỌC để tải.") }
-                    }
-                    override fun onError(id: String?, code: Int) {
-                        val cb = callbacks.remove(id)
-                        startedIds.remove(id)
-                        main.post { cb?.invoke("Máy không phát được giọng này (mã $code). Bấm CÀI GIỌNG ĐỌC để tải.") }
-                    }
-                })
-            }
-            queued?.let { (t, l, cb) ->
-                queued = null
-                if (ready) doSpeak(t, l, cb)
-                else main.post { cb("Không khởi động được bộ đọc (TTS). Cài 'Speech Services by Google' từ CH Play.") }
-            }
-        }
-    }
-
+    /**
+     * @param langTag BCP-47 (vd "bn-BD", "vi-VN", "ur-PK")
+     * @param onResult null = đang/đã phát; chuỗi = lý do không phát được
+     */
     fun speak(text: String, langTag: String, onResult: (String?) -> Unit = {}) {
         if (text.isBlank()) { onResult("Không có nội dung để đọc."); return }
-        val tag = langTag.ifBlank { "en-US" }
-        if (!ready) { queued = Triple(text, tag, onResult); return }
-        doSpeak(text, tag, onResult)
-    }
 
-    private fun doSpeak(text: String, langTag: String, onResult: (String?) -> Unit) {
-        val engine = tts ?: run { onResult("Bộ đọc chưa sẵn sàng."); return }
-
-        val locale = resolveLocale(engine, langTag)
-        if (locale == null) {
-            val base = langTag.substringBefore('-')
-            onResult("Máy chưa có giọng đọc cho ngôn ngữ này ($base). Bấm CÀI GIỌNG ĐỌC để tải.")
-            return
-        }
-
-        // Kiểm tra âm lượng đa phương tiện — TTS phát qua kênh MUSIC.
-        // Âm lượng 0 là nguyên nhân "câm" rất hay gặp mà không ai để ý.
+        // Âm lượng đa phương tiện = 0 là nguyên nhân câm hay gặp nhất
         val am = appCtx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         if (am != null && am.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
-            onResult("Âm lượng đa phương tiện đang ở 0 — hãy tăng âm lượng (nút volume) rồi bấm lại.")
+            onResult("Âm lượng đa phương tiện đang ở 0 — tăng âm lượng (nút volume) rồi bấm lại.")
             return
         }
 
-        engine.language = locale
-        engine.stop()
+        val tl = googleCode(langTag)
 
-        val id = "utt_${System.currentTimeMillis()}"
-        callbacks[id] = onResult
-
-        val r = engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
-        if (r != TextToSpeech.SUCCESS) {
-            callbacks.remove(id)
-            onResult("Bộ đọc từ chối phát. Kiểm tra âm lượng nhạc/đa phương tiện.")
-            return
-        }
-
-        // Nếu sau 4 giây mà chưa hề onStart -> coi như câm ngầm, báo người dùng
-        main.postDelayed({
-            if (callbacks.containsKey(id) && id !in startedIds) {
-                callbacks.remove(id)
-                onResult("Không nghe thấy tiếng? Giọng đọc cho ngôn ngữ này có thể chưa cài — bấm CÀI GIỌNG ĐỌC, hoặc tăng âm lượng đa phương tiện.")
+        scope.launch {
+            try {
+                val file = withContext(Dispatchers.IO) { fetchGoogleTts(text, tl) }
+                playFile(file, onResult)
+            } catch (e: Exception) {
+                // Mạng lỗi -> thử giọng đọc của máy
+                deviceFallback(text, langTag, onResult)
             }
-        }, 4000)
-    }
-
-    private fun resolveLocale(engine: TextToSpeech, tag: String): Locale? {
-        val full = Locale.forLanguageTag(tag)
-        if (isOk(engine, full)) return full
-
-        val base = tag.substringBefore('-')
-        if (base.isNotBlank()) {
-            val onlyLang = Locale.forLanguageTag(base)
-            if (isOk(engine, onlyLang)) return onlyLang
-            val v = runCatching { engine.voices?.firstOrNull { it.locale?.language == base } }.getOrNull()
-            if (v?.locale != null && isOk(engine, v.locale)) return v.locale
         }
-        return null
     }
 
-    private fun isOk(engine: TextToSpeech, loc: Locale): Boolean = try {
-        val r = engine.isLanguageAvailable(loc)
-        r == TextToSpeech.LANG_AVAILABLE ||
-                r == TextToSpeech.LANG_COUNTRY_AVAILABLE ||
-                r == TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE
-    } catch (e: Exception) { false }
+    // ── Tải MP3 từ Google (giống Google Dịch) ─────────────────
+    private fun fetchGoogleTts(text: String, tl: String): File {
+        val out = File(appCtx.cacheDir, "tts_${System.currentTimeMillis()}.mp3")
+        out.outputStream().use { os ->
+            // endpoint giới hạn ~200 ký tự/lần -> cắt nhỏ rồi nối lại
+            for (chunk in chunk(text, 190)) {
+                val url = "https://translate.google.com/translate_tts" +
+                        "?ie=UTF-8&client=tw-ob&tl=$tl" +
+                        "&q=" + java.net.URLEncoder.encode(chunk, "UTF-8")
+                val req = Request.Builder()
+                    .url(url)
+                    .header("User-Agent",
+                        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
+                    .header("Referer", "https://translate.google.com/")
+                    .build()
+                http.newCall(req).execute().use { r ->
+                    if (!r.isSuccessful) throw RuntimeException("TTS ${r.code}")
+                    r.body?.byteStream()?.copyTo(os) ?: throw RuntimeException("rỗng")
+                }
+            }
+        }
+        if (out.length() < 500) throw RuntimeException("audio rỗng")
+        return out
+    }
 
-    fun stop() { runCatching { tts?.stop() } }
-    fun shutdown() { runCatching { tts?.stop(); tts?.shutdown() } }
+    private fun playFile(file: File, onResult: (String?) -> Unit) {
+        release()
+        val mp = MediaPlayer()
+        mp.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+        )
+        try {
+            mp.setDataSource(file.path)
+            mp.setOnPreparedListener { it.start(); onResult(null) }
+            mp.setOnCompletionListener { runCatching { file.delete() }; release() }
+            mp.setOnErrorListener { _, _, _ ->
+                onResult("Không phát được audio."); release(); true
+            }
+            mp.prepareAsync()
+            player = mp
+        } catch (e: Exception) {
+            release()
+            onResult("Lỗi phát audio: ${e.message}")
+        }
+    }
+
+    // ── Dự phòng: giọng đọc của máy ───────────────────────────
+    private fun deviceFallback(text: String, langTag: String, onResult: (String?) -> Unit) {
+        if (!ttsReady) {
+            onResult("Mất mạng và máy chưa có bộ đọc offline. Bật mạng rồi thử lại.")
+            return
+        }
+        val loc = Locale.forLanguageTag(langTag.ifBlank { "en-US" })
+        val avail = tts.isLanguageAvailable(loc)
+        if (avail < TextToSpeech.LANG_AVAILABLE) {
+            onResult("Mất mạng, và máy chưa cài giọng đọc offline cho ngôn ngữ này.")
+            return
+        }
+        tts.language = loc
+        tts.setSpeechRate(0.9f)
+        val r = tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "fb")
+        onResult(if (r == TextToSpeech.SUCCESS) null else "Không phát được (offline).")
+    }
+
+    // ── Tiện ích ──────────────────────────────────────────────
+    /** Cắt văn bản thành đoạn <= max ký tự, không cắt giữa từ. */
+    private fun chunk(text: String, max: Int): List<String> {
+        if (text.length <= max) return listOf(text)
+        val out = mutableListOf<String>()
+        val sb = StringBuilder()
+        for (word in text.split(" ")) {
+            if (sb.length + word.length + 1 > max) {
+                if (sb.isNotEmpty()) { out.add(sb.toString().trim()); sb.clear() }
+            }
+            sb.append(word).append(" ")
+        }
+        if (sb.isNotEmpty()) out.add(sb.toString().trim())
+        return out
+    }
+
+    /** BCP-47 -> mã ngôn ngữ Google Dịch (tham số tl). */
+    private fun googleCode(tag: String): String {
+        val base = tag.substringBefore('-').lowercase()
+        return when (base) {
+            "zh" -> "zh-CN"
+            "yue" -> "zh-TW"
+            "fil" -> "tl"
+            "nb", "nn" -> "no"
+            "he" -> "iw"
+            "jv" -> "jw"
+            else -> base
+        }
+    }
+
+    private fun release() {
+        runCatching { player?.stop() }
+        runCatching { player?.release() }
+        player = null
+    }
+
+    fun stop() { release(); runCatching { tts.stop() } }
+
+    fun shutdown() {
+        release()
+        runCatching { tts.stop(); tts.shutdown() }
+        scope.cancel()
+    }
 }
 
-/** Mở màn hình cài thêm gói giọng đọc của Android. */
+/** Mở màn hình cài thêm gói giọng đọc offline của Android (dùng khi mất mạng). */
 fun openInstallVoice(ctx: Context) {
     val i = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    try {
-        ctx.startActivity(i)
-    } catch (e: Exception) {
-        // Máy không có Activity này -> mở thẳng cài đặt TTS
+    try { ctx.startActivity(i) }
+    catch (e: Exception) {
         runCatching {
             ctx.startActivity(
                 Intent("com.android.settings.TTS_SETTINGS")
