@@ -10,6 +10,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.window.Dialog
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -447,12 +449,24 @@ fun ChatTab(cfg: Config, speaker: Speaker, theirLang: String, theirLangTag: Stri
     val scope = rememberCoroutineScope()
     val recorder = remember { Recorder(ctx) }
 
+    // Ngôn ngữ 2 bên — mặc định: TÔI = tiếng Việt, HỌ = tự động phát hiện.
+    // Nếu tab Nhận diện đã ra kết quả, tự điền sẵn ngôn ngữ đối phương cho nhanh.
+    var myLang by remember { mutableStateOf(LangOptions.vietnamese) }
+    var theirOpt by remember {
+        mutableStateOf(
+            if (theirLang.isNotBlank())
+                LangOptions.list(false).firstOrNull { it.display == theirLang }
+                    ?: LangOptions.autoDetect
+            else LangOptions.autoDetect
+        )
+    }
+
+    var pickerFor by remember { mutableStateOf<Int?>(null) }   // 1 = họ, 2 = tôi
+
     var turns by remember { mutableStateOf<List<Turn>>(emptyList()) }
     var busy by remember { mutableStateOf(false) }
-    var who by remember { mutableStateOf<Boolean?>(null) }   // null = không ghi
+    var who by remember { mutableStateOf<Boolean?>(null) }
     var status by remember { mutableStateOf("") }
-
-    val lang = theirLang.ifBlank { "tiếng Anh" }
 
     fun handle(isForeigner: Boolean) {
         if (who == null) {
@@ -470,9 +484,17 @@ fun ChatTab(cfg: Config, speaker: Speaker, theirLang: String, theirLangTag: Stri
         scope.launch {
             busy = true; status = "Đang dịch…"
             try {
-                val (orig, trans) = Engine.chatTurn(cfg, f, wasForeigner, lang)
+                // Ai nói -> from là ngôn ngữ người đó; to là ngôn ngữ người kia
+                val from = if (wasForeigner) theirOpt else myLang
+                val to = if (wasForeigner) myLang else theirOpt
+                val (orig, trans) = Engine.chatTurn(cfg, f, from, to)
                 turns = turns + Turn(wasForeigner, orig, trans)
-                speaker.speak(trans, if (wasForeigner) "vi-VN" else theirLangTag)
+                // đọc bản dịch bằng ngôn ngữ ĐÍCH để người kia nghe
+                speaker.speak(trans, to.bcp47) { err ->
+                    if (err != null) android.widget.Toast.makeText(
+                        ctx, err, android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
                 status = ""
             } catch (e: Exception) { status = "Lỗi: ${e.message}" }
             busy = false
@@ -481,11 +503,16 @@ fun ChatTab(cfg: Config, speaker: Speaker, theirLang: String, theirLangTag: Stri
 
     Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("Hội thoại 2 chiều", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Text(
-            "Ngôn ngữ đối phương: $lang" +
-                    if (theirLang.isBlank()) " (chạy tab Nhận diện trước để tự nhận)" else "",
-            fontSize = 13.sp, color = Color.Gray
-        )
+
+        // ── 2 ô chọn ngôn ngữ ──
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            LangField("HỌ nói", theirOpt.display, Modifier.weight(1f)) { pickerFor = 1 }
+            LangField("TÔI nói", myLang.display, Modifier.weight(1f)) { pickerFor = 2 }
+        }
+        if (theirOpt.isAuto) {
+            Text("Bên HỌ để 'Tự động' — app tự dò. Chọn sẵn ngôn ngữ sẽ nhanh và chính xác hơn.",
+                fontSize = 12.sp, color = Color.Gray)
+        }
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
@@ -545,16 +572,86 @@ fun ChatTab(cfg: Config, speaker: Speaker, theirLang: String, theirLangTag: Stri
                             Text(t.translated, fontSize = 16.sp,
                                 fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
                             IconButton(onClick = {
-                                speaker.speak(
-                                    t.translated,
-                                    if (t.foreigner) "vi-VN" else theirLangTag
-                                ) { err ->
+                                val tag = if (t.foreigner) myLang.bcp47 else theirOpt.bcp47
+                                speaker.speak(t.translated, tag) { err ->
                                     if (err != null) android.widget.Toast.makeText(
                                         ctx, err, android.widget.Toast.LENGTH_LONG
                                     ).show()
                                 }
                             }) { Icon(Icons.Default.VolumeUp, null) }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Dialog chọn ngôn ngữ ──
+    pickerFor?.let { target ->
+        LanguagePickerDialog(
+            withAuto = target == 1,             // chỉ bên HỌ mới có "Tự động"
+            onPick = { opt ->
+                if (target == 1) theirOpt = opt else myLang = opt
+                pickerFor = null
+            },
+            onDismiss = { pickerFor = null }
+        )
+    }
+}
+
+/** Ô hiển thị ngôn ngữ đang chọn, bấm để mở dialog. */
+@Composable
+private fun LangField(label: String, value: String, modifier: Modifier, onClick: () -> Unit) {
+    OutlinedButton(onClick = onClick, modifier = modifier.height(56.dp)) {
+        Column(horizontalAlignment = Alignment.Start, modifier = Modifier.weight(1f)) {
+            Text(label, fontSize = 10.sp, color = Color.Gray)
+            Text(value, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+        }
+        Icon(Icons.Default.ArrowDropDown, null)
+    }
+}
+
+/** Dialog danh sách ngôn ngữ + ô tìm kiếm. */
+@Composable
+private fun LanguagePickerDialog(
+    withAuto: Boolean,
+    onPick: (LangOption) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+    val all = remember(withAuto) { LangOptions.list(withAuto) }
+    val filtered = all.filter {
+        query.isBlank() || it.display.lowercase().contains(query.lowercase())
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = MaterialTheme.shapes.medium, color = Color.White) {
+            Column(Modifier.padding(16.dp).fillMaxWidth()) {
+                Text("Chọn ngôn ngữ", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    label = { Text("Tìm (vd: Bengali, Anh, Ả Rập…)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                Column(
+                    Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())
+                ) {
+                    if (filtered.isEmpty()) {
+                        Text("Không tìm thấy.", Modifier.padding(12.dp), color = Color.Gray)
+                    }
+                    filtered.forEach { opt ->
+                        Text(
+                            opt.display,
+                            Modifier.fillMaxWidth()
+                                .clickable { onPick(opt) }
+                                .padding(vertical = 12.dp),
+                            fontSize = 15.sp
+                        )
+                        HorizontalDivider()
                     }
                 }
             }
