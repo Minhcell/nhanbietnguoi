@@ -148,3 +148,57 @@ object Languages {
             "Tham chiếu nội bộ: không có trong bảng — hãy tự xác định các nước sử dụng ngôn ngữ \"$whisperLang\"."
     }
 }
+
+/** Một lựa chọn ngôn ngữ trong ô chọn của tab Hội thoại. */
+data class LangOption(
+    val display: String,     // tên hiển thị tiếng Việt
+    val whisperKey: String?, // key Whisper (null = tự động phát hiện)
+    val iso: String?,        // mã ISO-639-1 để ép Whisper (null = tự động)
+    val bcp47: String        // mã đọc TTS
+) {
+    val isAuto: Boolean get() = iso == null
+}
+
+object LangOptions {
+
+    /** "TÔI NÓI" hay dùng nhất — đưa lên đầu cho dễ chọn. */
+    private val PRIORITY = listOf("vietnamese", "bengali", "english", "hindi", "urdu", "chinese")
+
+    /**
+     * Danh sách ngôn ngữ để chọn.
+     * @param withAuto true -> thêm mục "Tự động phát hiện" ở đầu (dùng cho bên HỌ NÓI).
+     */
+    fun list(withAuto: Boolean): List<LangOption> {
+        val result = mutableListOf<LangOption>()
+
+        if (withAuto) {
+            result += LangOption("🌐 Tự động phát hiện", null, null, "en-US")
+        }
+
+        // đưa nhóm ưu tiên lên trước
+        PRIORITY.forEach { key ->
+            Languages.MAP[key]?.let { info ->
+                result += LangOption(info.vi, key, info.tag.substringBefore('-'), info.tag)
+            }
+        }
+
+        // phần còn lại, xếp theo tên tiếng Việt
+        Languages.MAP.entries
+            .filter { it.key !in PRIORITY }
+            .map { (key, info) ->
+                LangOption(info.vi, key, info.tag.substringBefore('-'), info.tag)
+            }
+            .sortedBy { it.display }
+            .let { result.addAll(it) }
+
+        return result
+    }
+
+    val vietnamese: LangOption =
+        Languages.MAP["vietnamese"]!!.let {
+            LangOption(it.vi, "vietnamese", "vi", it.tag)
+        }
+
+    val autoDetect: LangOption =
+        LangOption("🌐 Tự động phát hiện", null, null, "en-US")
+}
