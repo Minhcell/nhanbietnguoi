@@ -44,7 +44,7 @@ object Api {
 
         val builder = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart("file", audio.name, audio.asRequestBody("audio/m4a".toMediaType()))
+            .addFormDataPart("file", audio.name, audio.asRequestBody("audio/wav".toMediaType()))
             .addFormDataPart("model", "whisper-1")
             .addFormDataPart("response_format", "verbose_json")
 
@@ -78,64 +78,88 @@ object Api {
         claudeKey: String
     ): JSONObject = withContext(Dispatchers.IO) {
 
-        val voiceBlock = if (voice != null && voice.text.isNotBlank()) {
+        val hasVoice = voice != null && voice.text.isNotBlank()
+        val hasImage = images.isNotEmpty()
+
+        // Xác định chế độ phân tích theo bằng chứng đang có
+        val mode = when {
+            hasVoice && hasImage -> "KẾT HỢP — có cả giọng nói và ảnh. Phân tích cả hai rồi ĐỐI CHIẾU CHÉO."
+            hasVoice             -> "CHỈ GIỌNG NÓI — không có ảnh. Phân tích hoàn toàn dựa trên ngôn ngữ nghe được."
+            hasImage             -> "CHỈ HÌNH ẢNH — không có ghi âm. Phân tích hoàn toàn dựa trên chữ viết / giấy tờ trong ảnh."
+            else                 -> "KHÔNG CÓ BẰNG CHỨNG"
+        }
+
+        val voiceBlock = if (hasVoice) {
             """
             === BẰNG CHỨNG GIỌNG NÓI ===
-            - Ngôn ngữ Whisper phát hiện: ${voice.language}
+            - Ngôn ngữ Whisper tự phát hiện: ${voice!!.language}
+            - ${Languages.hint(voice.language)}
             - Đối chiếu ngoại tuyến (ML Kit): ${offlineGuess ?: "không có"}
             - Nội dung nói: "${voice.text}"
             - Độ dài: ${"%.1f".format(voice.durationSec)} giây
             """.trimIndent()
         } else {
-            "=== BẰNG CHỨNG GIỌNG NÓI ===\n(Không có)"
+            "=== BẰNG CHỨNG GIỌNG NÓI ===\n(Không có — bỏ qua phần này)"
         }
 
-        val imageBlock = if (images.isNotEmpty())
-            "=== BẰNG CHỨNG HÌNH ẢNH ===\nCó ${images.size} ảnh đính kèm bên dưới."
+        val imageBlock = if (hasImage)
+            "=== BẰNG CHỨNG HÌNH ẢNH ===\nCó ${images.size} ảnh đính kèm bên dưới. Hãy đọc kỹ mọi chữ viết trong đó."
         else
-            "=== BẰNG CHỨNG HÌNH ẢNH ===\n(Không có)"
+            "=== BẰNG CHỨNG HÌNH ẢNH ===\n(Không có — bỏ qua phần này)"
 
         val prompt = """
 Bạn là trợ lý phân tích tài liệu & ngôn ngữ, giúp người Việt xác định một người nước ngoài đến từ đâu và giao tiếp được với họ.
+
+>>> CHẾ ĐỘ PHÂN TÍCH: $mode
 
 $voiceBlock
 
 $imageBlock
 
+QUY TẮC PHÂN TÍCH GIỌNG NÓI:
+- Ngôn ngữ nào cũng phải xử lý được, kể cả ngôn ngữ hiếm (Bengali, Pashto, Amhara, Wolof, Uzbek, Sinhala...).
+- Nếu ngôn ngữ đó có nhiều nước dùng (Ả Rập, Anh, Pháp, Tây Ban Nha, Bồ Đào Nha), hãy dùng PHƯƠNG NGỮ / GIỌNG / TỪ VỰNG trong câu nói để thu hẹp nước, và nói rõ mức độ chắc chắn.
+- Đoạn ghi dưới 5 giây thì độ tin cậy phải để "thấp" và nói rõ là cần ghi dài hơn.
+
 QUY TẮC PHÂN TÍCH ẢNH — BẮT BUỘC TUYỆT ĐỐI:
-- CHỈ đọc và phân tích: CHỮ VIẾT (viết tay hoặc đánh máy), giấy tờ, hộ chiếu, visa, thẻ cư trú, vé, con dấu, biển hiệu, tin nhắn trên màn hình, tiền tệ, quốc kỳ, logo, tên cơ quan cấp.
-- Chú ý HỆ CHỮ vì nó phân biệt rất mạnh: Bengali (বাংলা) vs Devanagari/Hindi (हिन्दी) vs Urdu (اردو) vs Ả Rập vs Thái vs Hán vs Kirin...
-- Trên hộ chiếu/visa hãy tìm: mã quốc gia 3 chữ (BGD=Bangladesh, IND=Ấn Độ, PAK=Pakistan, PSE=Palestine, NPL=Nepal, LKA=Sri Lanka...), dòng MRZ ở đáy trang, tên nước phát hành, con dấu.
-- TUYỆT ĐỐI KHÔNG phân tích khuôn mặt, màu da, dáng người, tóc, hay bất kỳ đặc điểm cơ thể nào của người trong ảnh. Nếu ảnh chỉ có mặt người mà không có chữ hay giấy tờ, hãy trả về ket_luan = "Không đủ bằng chứng" và nói rõ rằng khuôn mặt KHÔNG cho biết quốc tịch, cần chụp giấy tờ hoặc ghi âm giọng nói.
+- CHỈ đọc và phân tích: CHỮ VIẾT (viết tay hoặc đánh máy), giấy tờ, hộ chiếu, visa, thẻ cư trú, giấy phép lao động, vé, con dấu, biển hiệu, tin nhắn trên màn hình, tiền tệ, quốc kỳ, logo, tên cơ quan cấp.
+- Chú ý HỆ CHỮ vì nó phân biệt rất mạnh: Bengali (বাংলা) vs Devanagari/Hindi (हिन्दी) vs Urdu (اردو) vs Ả Rập vs Thái vs Hán vs Kirin vs Ethiopic...
+- Trên hộ chiếu/visa hãy tìm: MÃ QUỐC GIA 3 CHỮ (BGD=Bangladesh, IND=Ấn Độ, PAK=Pakistan, PSE=Palestine, NPL=Nepal, LKA=Sri Lanka, MMR=Myanmar, PHL=Philippines, NGA=Nigeria, EGY=Ai Cập...), DÒNG MRZ ở đáy trang, tên nước phát hành, con dấu, số hộ chiếu.
+- TUYỆT ĐỐI KHÔNG phân tích khuôn mặt, màu da, dáng người, tóc hay bất kỳ đặc điểm cơ thể nào. Nếu ảnh CHỈ có mặt người mà không có chữ hay giấy tờ, trả về ket_luan = "Không đủ bằng chứng" và nói rõ khuôn mặt KHÔNG cho biết quốc tịch.
+
+QUY TẮC ĐỐI CHIẾU (khi có cả hai):
+- Nếu ảnh có giấy tờ ghi rõ quốc tịch -> GIẤY TỜ THẮNG, độ tin cậy cao.
+- Nếu giọng nói và giấy tờ mâu thuẫn (vd giấy tờ Ấn Độ nhưng nói tiếng Bengali) -> nói rõ mâu thuẫn và giải thích khả năng (vd người Bengal ở Tây Bengal, Ấn Độ).
+- Nếu hai nguồn khớp nhau -> nâng độ tin cậy lên "cao".
 
 TRẢ VỀ DUY NHẤT một object JSON, không markdown, không lời dẫn:
 
 {
   "ket_luan": "Tên nước (nếu bằng chứng đủ chắc) HOẶC 'Chưa đủ chắc chắn' HOẶC 'Không đủ bằng chứng'",
   "do_tin_cay": "cao | trung bình | thấp",
-  "ly_do": "1-2 câu: dựa vào bằng chứng cụ thể nào (mã BGD trên visa, chữ Bengali, Whisper nhận ra tiếng Bengali...)",
+  "nguon_phan_tich": "giọng nói | hình ảnh | cả hai",
+  "ly_do": "1-2 câu: dựa vào bằng chứng cụ thể nào",
   "bang_chung_anh": ["Từng thứ đọc được từ ảnh: chữ gì, hệ chữ gì, giấy tờ gì, mã nước gì. Mảng rỗng nếu không có ảnh."],
   "bang_chung_giong": "Ngôn ngữ nghe được và nó gợi ý nước nào. Ghi 'Không có' nếu không ghi âm.",
-  "doi_chieu": "Hai nguồn có khớp nhau không? Nếu mâu thuẫn thì nói rõ.",
+  "doi_chieu": "Hai nguồn có khớp không? Ghi 'Chỉ có 1 nguồn' nếu chỉ có một loại bằng chứng.",
   "cac_nuoc": [
     {"nuoc": "Tên nước", "kha_nang": "cao | trung bình | thấp", "ghi_chu": "vì sao"}
   ],
   "ngon_ngu": "Ngôn ngữ họ dùng (tiếng Việt)",
-  "ma_ngon_ngu": "Mã BCP-47 để đọc thành tiếng, vd bn-IN cho Bengali, hi-IN, ur-PK, ar-SA, en-US",
+  "ma_ngon_ngu": "Mã BCP-47 để đọc thành tiếng, vd bn-BD, hi-IN, ur-PK, ar-SA, en-US",
   "dich_tieng_viet": "Dịch nội dung họ nói / chữ trong ảnh sang tiếng Việt",
   "cau_hoi_goi_y": [
     {"tieng_viet": "Bạn đến từ nước nào?", "ban_dich": "dịch sang ngôn ngữ của họ", "phien_am": "cách đọc gần đúng cho người Việt"}
   ],
-  "buoc_tiep_theo": "Cần thêm bằng chứng gì để chắc chắn hơn (vd: chụp trang thông tin hộ chiếu, ghi âm dài hơn 10 giây)",
-  "luu_y": "Nhắc rằng ngôn ngữ không đồng nghĩa quốc tịch, và giấy tờ là bằng chứng chắc chắn nhất"
+  "buoc_tiep_theo": "Cần thêm bằng chứng gì để chắc hơn",
+  "luu_y": "Nhắc rằng ngôn ngữ không đồng nghĩa quốc tịch, giấy tờ là bằng chứng chắc nhất"
 }
 
 - "cac_nuoc" xếp theo khả năng giảm dần, tối đa 4 nước.
-- Cho 3-4 câu hỏi gợi ý thực dụng để bắt chuyện và hỏi thẳng họ đến từ đâu.
-- Nếu bằng chứng yếu, hãy nói thẳng là yếu. Không bịa ra sự chắc chắn.
+- Cho 3-4 câu hỏi gợi ý thực dụng để hỏi thẳng họ đến từ đâu.
+- Bằng chứng yếu thì nói thẳng là yếu. KHÔNG bịa ra sự chắc chắn.
         """.trimIndent()
 
-        // content = [ảnh..., text]
         val content = JSONArray()
         images.forEach { img ->
             content.put(JSONObject().apply {
